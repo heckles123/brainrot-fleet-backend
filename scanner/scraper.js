@@ -1,22 +1,18 @@
 // ============================================================================
-// scraper.js — High-Throughput Concurrent Roblox Server Scraper
+// scraper.js — High-Throughput Roblox Server Scraper
 // ============================================================================
 //
-// DESIGN:
-//   Maximum throughput. Every proxy runs its own independent pagination
-//   worker concurrently. All fire at the same time via Promise.allSettled.
-//   Pool has NO upper size limit — every discovered Job ID is stored.
-//   The pool uses an index-based atomic queue so no two bots ever receive
-//   the same Job ID even under hundreds of concurrent requests.
-//   Scrape loop runs continuously with configurable micro-delay.
+// OPTIMIZED FOR ROTATING RESIDENTIAL PROXIES (e.g., Smartproxy)
 //
-// ARCHITECTURE:
-//   - N proxies = N concurrent pagination workers per cycle
-//   - Each worker independently walks all pages via nextPageCursor
-//   - O(1) dequeue via head index (no array.shift/splice overhead)
-//   - O(1) dedup via Set
-//   - Periodic compaction reclaims consumed array memory
-//   - History TTL eviction keeps memory bounded
+// With a rotating proxy gateway, every request automatically gets a
+// different IP from a pool of millions. This means:
+//   - We can run MANY concurrent workers (20+) without rate limits
+//   - We create a NEW proxy agent per request (forces IP rotation)
+//   - We don't need a list of static proxies — one URL does it all
+//   - Roblox sees each request from a unique residential IP
+//
+// The pool has NO upper size limit. Every discovered Job ID is stored.
+// The queue uses an atomic index-based design for O(1) dequeue.
 //
 // ============================================================================
 
@@ -30,49 +26,77 @@ const { HttpsProxyAgent } = require("https-proxy-agent");
 const PLACE_ID = process.env.PLACE_ID || "109983668079237";
 const SERVERS_API = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public`;
 
-// Delay between full scrape cycles (ms). 0 = tight loop (max speed).
-const CYCLE_DELAY_MS = parseInt(process.env.SCRAPER_CYCLE_DELAY_MS || "2000", 10);
+// ─── PROXY CONFIG ───
+// ROTATING PROXY: A single gateway URL where every request gets a new IP.
+// This is the recommended setup for Smartproxy, Bright Data, IPRoyal, etc.
+// Example: http://user:pass@gate.smartproxy.com:10001
+const ROTATING_PROXY_URL = process.env.ROTATING_PROXY_URL || "";
 
-// Delay between page fetches PER PROXY within a cycle (ms).
-// Each proxy respects this independently. Low = aggressive.
-const PER_PROXY_PAGE_DELAY_MS = parseInt(process.env.PER_PROXY_PAGE_DELAY_MS || "100", 10);
-
-// Max pages each proxy chases per cycle
-const MAX_PAGES_PER_PROXY = parseInt(process.env.MAX_PAGES_PER_PROXY || "50", 10);
-
-// Concurrent direct workers when no proxies are configured
-const DIRECT_WORKERS = parseInt(process.env.SCRAPER_DIRECT_WORKERS || "2", 10);
-
-// Minimum players in server to add to pool (skip empties)
-const MIN_PLAYERS = parseInt(process.env.SCRAPER_MIN_PLAYERS || "1", 10);
-
-// Scanned server cooldown before it can be re-queued (ms)
-const HISTORY_COOLDOWN_MS = parseInt(process.env.HISTORY_COOLDOWN_MS || "300000", 10);
-
-// Max history entries (memory ceiling, set high)
-const HISTORY_MAX_SIZE = parseInt(process.env.HISTORY_MAX_SIZE || "50000", 10);
-
-// Per-request timeout (ms)
-const FETCH_TIMEOUT_MS = parseInt(process.env.SCRAPER_FETCH_TIMEOUT_MS || "12000", 10);
-
-// Retries on 429 per proxy per page
-const RETRY_ON_429 = parseInt(process.env.SCRAPER_RETRY_ON_429 || "2", 10);
-
-// Proxy list
+// STATIC PROXY LIST: Comma-separated list of fixed proxy URLs (fallback).
+// Only used if ROTATING_PROXY_URL is not set.
 const PROXY_LIST_RAW = process.env.PROXY_LIST || "";
 
+// ─── WORKER CONFIG ───
+// How many concurrent pagination workers to run per scrape cycle.
+// With rotating proxies, each worker gets unique IPs, so more = faster.
+// With static proxies or direct mode, keep this lower.
+const WORKER_COUNT = parseInt(process.env.SCRAPER_WORKER_COUNT || "0", 10);
+// 0 = auto-detect: 15 for rotating, count for static list, 2 for direct
+
+// ─── TIMING CONFIG ───
+// Delay between full scrape cycles (ms)
+const CYCLE_DELAY_MS = parseInt(process.env.SCRAPER_CYCLE_DELAY_MS || "2000", 10);
+
+// Delay between page fetches per worker (ms)
+const PAGE_DELAY_MS = parseInt(process.env.PER_PROXY_PAGE_DELAY_MS || "50", 10);
+
+// Max pages each worker chases per cycle
+const MAX_PAGES_PER_WORKER = parseInt(process.env.MAX_PAGES_PER_PROXY || "50", 10);
+
+// ─── FILTER CONFIG ───
+// Minimum players in server to add to pool (skip empty servers)
+const MIN_PLAYERS = parseInt(process.env.SCRAPER_MIN_PLAYERS || "1", 10);
+
+// ─── HISTORY CONFIG ───
+// How long before a scanned server can be re-discovered (ms)
+const HISTORY_COOLDOWN_MS = parseInt(process.env.HISTORY_COOLDOWN_MS || "300000", 10);
+
+// Max history entries (memory ceiling)
+const HISTORY_MAX_SIZE = parseInt(process.env.HISTORY_MAX_SIZE || "50000", 10);
+
+// ─── REQUEST CONFIG ───
+const FETCH_TIMEOUT_MS = parseInt(process.env.SCRAPER_FETCH_TIMEOUT_MS || "15000", 10);
+const RETRY_ON_429 = parseInt(process.env.SCRAPER_RETRY_ON_429 || "2", 10);
+
 // ---------------------------------------------------------------------------
-// Proxy Setup
+// Proxy Mode Detection
 // ---------------------------------------------------------------------------
 
-const proxyUrls = PROXY_LIST_RAW.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+// Parse static proxies (only used if no rotating proxy is set)
+const staticProxies = PROXY_LIST_RAW.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 
-// Pre-build reusable proxy agents
-const proxyAgents = proxyUrls.map((url) => ({
-  url,
-  agent: new HttpsProxyAgent(url),
-  label: url.replace(/^https?:\/\/[^@]+@/, ""),
-}));
+// Determine proxy mode
+let proxyMode;
+if (ROTATING_PROXY_URL) {
+  proxyMode = "rotating";
+} else if (staticProxies.length > 0) {
+  proxyMode = "static";
+} else {
+  proxyMode = "direct";
+}
+
+// Determine effective worker count
+let effectiveWorkers;
+if (WORKER_COUNT > 0) {
+  effectiveWorkers = WORKER_COUNT;
+} else {
+  // Auto-detect based on proxy mode
+  switch (proxyMode) {
+    case "rotating":  effectiveWorkers = 15; break;  // Rotating can handle many
+    case "static":    effectiveWorkers = staticProxies.length; break;
+    case "direct":    effectiveWorkers = 2; break;
+  }
+}
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}][SCRAPER] ${msg}`);
@@ -83,25 +107,65 @@ function sleep(ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy Agent Factory
+// ---------------------------------------------------------------------------
+
+// Pre-build static proxy agents (reusable)
+const staticAgents = staticProxies.map((url, i) => ({
+  agent: new HttpsProxyAgent(url),
+  label: `static-${i}`,
+}));
+
+/**
+ * Get a proxy agent for a request.
+ *
+ * ROTATING MODE: Creates a NEW HttpsProxyAgent instance every call.
+ * This is intentional — rotating gateways assign a new IP per connection,
+ * so reusing an agent may reuse the same TCP connection and same IP.
+ * Creating a fresh agent forces a new connection = new IP.
+ *
+ * STATIC MODE: Returns the agent for the given worker index (round-robin).
+ * DIRECT MODE: Returns null (no proxy).
+ */
+function getAgent(workerIndex) {
+  switch (proxyMode) {
+    case "rotating":
+      // New agent = new connection = new IP from the rotating gateway
+      return new HttpsProxyAgent(ROTATING_PROXY_URL);
+
+    case "static":
+      return staticAgents[workerIndex % staticAgents.length].agent;
+
+    case "direct":
+    default:
+      return null;
+  }
+}
+
+function getWorkerLabel(workerIndex) {
+  switch (proxyMode) {
+    case "rotating": return `rot-${workerIndex}`;
+    case "static":   return `static-${workerIndex % staticAgents.length}`;
+    case "direct":   return `direct-${workerIndex}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ATOMIC QUEUE — Lock-Free Job ID Pool
 // ---------------------------------------------------------------------------
 //
-// Node.js is single-threaded so there are no true race conditions, but
-// this design guarantees that every call to dequeueBatch() gets unique
-// items even when hundreds of async Express handlers resolve in the
-// same event loop turn — because the headIndex increment is synchronous.
-//
-// No array mutation on dequeue (no shift/splice). O(1) per item.
-// Periodic compaction reclaims memory from consumed slots.
+// Array + head index. O(1) dequeue, no array mutation.
+// Node.js single-threaded = synchronous index increment is atomic.
+// Periodic compaction reclaims consumed memory.
 // ---------------------------------------------------------------------------
 
 let pool = [];
 let headIndex = 0;
-const knownIds = new Set(); // Every ID ever seen (pool + assigned + history)
+const knownIds = new Set(); // All IDs ever seen (dedup)
 
 /**
- * Atomically dequeue up to `count` Job IDs from the pool.
- * Guaranteed unique — no two calls ever return the same ID.
+ * Atomically dequeue up to `count` Job IDs.
+ * Guaranteed unique across all concurrent async handlers.
  */
 function dequeueBatch(count) {
   const available = pool.length - headIndex;
@@ -109,30 +173,24 @@ function dequeueBatch(count) {
   if (take <= 0) return [];
 
   const start = headIndex;
-  headIndex += take; // Atomic within the synchronous call
+  headIndex += take;
 
   const batch = pool.slice(start, start + take);
 
-  // Compact when consumed portion exceeds threshold
+  // Compact when >10k consumed slots and >50% consumed
   if (headIndex > 10000 && headIndex > pool.length * 0.5) {
     pool = pool.slice(headIndex);
     headIndex = 0;
-    log(`Queue compacted (freed ${start} consumed slots)`);
+    log(`Queue compacted, freed ${start} consumed slots`);
   }
 
   return batch;
 }
 
-/**
- * Count of Job IDs available for assignment right now.
- */
 function availableCount() {
   return pool.length - headIndex;
 }
 
-/**
- * Enqueue a new Job ID. Returns false if already known (dedup).
- */
 function enqueue(jobId) {
   if (knownIds.has(jobId)) return false;
   knownIds.add(jobId);
@@ -140,9 +198,6 @@ function enqueue(jobId) {
   return true;
 }
 
-/**
- * Re-add a Job ID to the back of the queue (expired assignment).
- */
 function requeue(jobId) {
   pool.push(jobId);
 }
@@ -154,8 +209,8 @@ function requeue(jobId) {
 const scanHistory = new Map();
 
 function addToHistory(jobId, botId, found = false) {
-  // Bulk evict oldest 10% when at capacity
   if (scanHistory.size >= HISTORY_MAX_SIZE) {
+    // Bulk evict oldest 10%
     const evictCount = Math.floor(HISTORY_MAX_SIZE * 0.1);
     let evicted = 0;
     for (const key of scanHistory.keys()) {
@@ -178,7 +233,7 @@ function isInHistory(jobId) {
   return true;
 }
 
-// Periodic history cleanup
+// Periodic history cleanup (every 60s)
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
@@ -192,7 +247,7 @@ setInterval(() => {
   if (cleaned > 0) log(`History cleanup: evicted ${cleaned} expired entries`);
 }, 60000);
 
-// Periodic knownIds cleanup — purge IDs that are consumed and not in history
+// Periodic knownIds cleanup (every 2 min)
 setInterval(() => {
   if (knownIds.size > 100000) {
     const before = knownIds.size;
@@ -207,24 +262,27 @@ setInterval(() => {
 }, 120000);
 
 // ---------------------------------------------------------------------------
-// PAGE FETCHER — Single page with retry on 429
+// PAGE FETCHER
 // ---------------------------------------------------------------------------
 
-async function fetchPage(cursor, agent) {
+async function fetchPage(cursor, workerIndex) {
   const url = `${SERVERS_API}?sortOrder=Asc&limit=100${cursor ? `&cursor=${cursor}` : ""}`;
-
-  const opts = {
-    method: "GET",
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-    timeout: FETCH_TIMEOUT_MS,
-  };
-  if (agent) opts.agent = agent;
 
   for (let attempt = 0; attempt <= RETRY_ON_429; attempt++) {
     try {
+      // Get a fresh agent per request (critical for rotating proxies)
+      const agent = getAgent(workerIndex);
+
+      const opts = {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+        timeout: FETCH_TIMEOUT_MS,
+      };
+      if (agent) opts.agent = agent;
+
       const res = await fetch(url, opts);
 
       if (res.status === 429) {
@@ -253,17 +311,18 @@ async function fetchPage(cursor, agent) {
 }
 
 // ---------------------------------------------------------------------------
-// WORKER — One proxy's independent pagination loop
+// WORKER — One pagination stream
 // ---------------------------------------------------------------------------
 
-async function runWorker(agent, label) {
+async function runWorker(workerIndex) {
+  const label = getWorkerLabel(workerIndex);
   let cursor = "";
   let added = 0;
   let pages = 0;
   let rateLimited = false;
 
-  for (let page = 0; page < MAX_PAGES_PER_PROXY; page++) {
-    const result = await fetchPage(cursor, agent);
+  for (let page = 0; page < MAX_PAGES_PER_WORKER; page++) {
+    const result = await fetchPage(cursor, workerIndex);
     pages++;
 
     if (result.rateLimited) { rateLimited = true; break; }
@@ -280,14 +339,14 @@ async function runWorker(agent, label) {
     cursor = result.nextPageCursor;
     if (!cursor) break;
 
-    if (PER_PROXY_PAGE_DELAY_MS > 0) await sleep(PER_PROXY_PAGE_DELAY_MS);
+    if (PAGE_DELAY_MS > 0) await sleep(PAGE_DELAY_MS);
   }
 
   return { label, added, pages, rateLimited };
 }
 
 // ---------------------------------------------------------------------------
-// SCRAPE CYCLE — Fire all workers concurrently
+// SCRAPE CYCLE
 // ---------------------------------------------------------------------------
 
 const stats = {
@@ -312,18 +371,10 @@ async function scrape() {
   let totalPages = 0;
 
   try {
+    // Fire all workers concurrently
     const workers = [];
-
-    if (proxyAgents.length > 0) {
-      // One worker per proxy, all concurrent
-      for (const proxy of proxyAgents) {
-        workers.push(runWorker(proxy.agent, proxy.label));
-      }
-    } else {
-      // No proxies: fire DIRECT_WORKERS concurrent direct workers
-      for (let i = 0; i < DIRECT_WORKERS; i++) {
-        workers.push(runWorker(null, `direct-${i}`));
-      }
+    for (let i = 0; i < effectiveWorkers; i++) {
+      workers.push(runWorker(i));
     }
 
     const results = await Promise.allSettled(workers);
@@ -351,12 +402,12 @@ async function scrape() {
     stats.lastCycleTime = new Date().toISOString();
     stats.lastCycleWorkers = workerResults;
 
-    const ok = workerResults.filter((w) => !w.error).length;
+    const ok = workerResults.filter((w) => !w.error && !w.rateLimited).length;
     const rl = workerResults.filter((w) => w.rateLimited).length;
 
     log(
       `Cycle #${stats.totalCycles}: +${totalAdded} IDs | ${totalPages} pages | ` +
-      `${ok}/${workers.length} workers | ${elapsed}ms | ` +
+      `${ok}/${workers.length} workers OK | ${elapsed}ms | ` +
       `pool: ${availableCount()} avail / ${knownIds.size} discovered` +
       `${rl > 0 ? ` | ${rl} rate-limited` : ""}`
     );
@@ -370,7 +421,7 @@ async function scrape() {
 }
 
 // ---------------------------------------------------------------------------
-// CONTINUOUS LOOP — Tight scrape-rescrape cycle
+// CONTINUOUS LOOP
 // ---------------------------------------------------------------------------
 
 let loopRunning = false;
@@ -381,14 +432,14 @@ async function startContinuousLoop() {
   stats.continuousMode = true;
 
   log(
-    `Continuous scraper started (${proxyAgents.length || DIRECT_WORKERS} workers, ` +
-    `${CYCLE_DELAY_MS}ms cycle delay, ${PER_PROXY_PAGE_DELAY_MS}ms page delay, ` +
-    `${MAX_PAGES_PER_PROXY} max pages/worker)`
+    `Continuous scraper started | mode: ${proxyMode} | ` +
+    `workers: ${effectiveWorkers} | cycle delay: ${CYCLE_DELAY_MS}ms | ` +
+    `page delay: ${PAGE_DELAY_MS}ms | max pages/worker: ${MAX_PAGES_PER_WORKER}`
   );
 
   while (loopRunning) {
     await scrape();
-    await sleep(Math.max(CYCLE_DELAY_MS, 1)); // Yield to event loop
+    await sleep(Math.max(CYCLE_DELAY_MS, 1));
   }
 }
 
@@ -428,14 +479,15 @@ module.exports = {
 
   config: {
     PLACE_ID,
+    proxyMode,
+    proxyCount: proxyMode === "rotating" ? "rotating gateway" : (proxyMode === "static" ? staticProxies.length : 0),
+    effectiveWorkers,
     CYCLE_DELAY_MS,
-    PER_PROXY_PAGE_DELAY_MS,
-    MAX_PAGES_PER_PROXY,
-    DIRECT_WORKERS,
+    PAGE_DELAY_MS,
+    MAX_PAGES_PER_WORKER,
     MIN_PLAYERS,
     HISTORY_COOLDOWN_MS,
     HISTORY_MAX_SIZE,
     FETCH_TIMEOUT_MS,
-    proxyCount: proxyAgents.length,
   },
 };
