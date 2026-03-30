@@ -405,7 +405,7 @@ function stopLoop() {
 module.exports = {
   dequeueBatch,
   availableCount,
-  totalEnqueued,
+  totalEnqueued: () => pool.length,
   requeue,
   enqueue,
 
