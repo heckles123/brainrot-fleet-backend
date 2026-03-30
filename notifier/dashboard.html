@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Brainrot Fleet Scanner — Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d0f14; color: #c8ccd4; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 14px; line-height: 1.5; padding: 16px;
+  }
+  h1 { color: #fff; font-size: 20px; margin-bottom: 4px; }
+  h2 { color: #8b92a0; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #1e2230; }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .pulse { width: 10px; height: 10px; background: #00ff88; border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .status-text { color: #8b92a0; font-size: 12px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat-card {
+    background: #141720; border: 1px solid #1e2230; border-radius: 8px; padding: 14px;
+  }
+  .stat-card .label { color: #8b92a0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card .value { color: #fff; font-size: 24px; font-weight: 700; margin-top: 4px; }
+  .stat-card .sub { color: #555d6e; font-size: 11px; margin-top: 2px; }
+
+  .tier-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+  .tier-1 { background: #ff004020; color: #ff4060; border: 1px solid #ff004040; }
+  .tier-2 { background: #ffaa0020; color: #ffcc44; border: 1px solid #ffaa0040; }
+  .tier-3 { background: #00cc8820; color: #00ff88; border: 1px solid #00cc8840; }
+
+  .section { margin-bottom: 24px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: #555d6e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; padding: 8px 10px; border-bottom: 1px solid #1e2230; }
+  td { padding: 8px 10px; border-bottom: 1px solid #141720; font-size: 13px; }
+  tr:hover td { background: #141720; }
+
+  .copy-btn {
+    background: #1e2230; color: #8b92a0; border: 1px solid #2a2f3e; border-radius: 4px;
+    padding: 3px 10px; cursor: pointer; font-size: 11px; transition: all 0.15s;
+  }
+  .copy-btn:hover { background: #2a2f3e; color: #fff; }
+  .copy-btn.copied { background: #00cc88; color: #000; border-color: #00cc88; }
+
+  .alive { color: #00ff88; }
+  .dead { color: #ff4060; }
+
+  .sparkline-container { background: #141720; border: 1px solid #1e2230; border-radius: 8px; padding: 14px; }
+  .sparkline { display: flex; align-items: flex-end; gap: 3px; height: 60px; }
+  .spark-bar {
+    flex: 1; background: #00cc88; border-radius: 2px 2px 0 0; min-height: 2px;
+    transition: height 0.3s ease;
+  }
+  .spark-labels { display: flex; justify-content: space-between; margin-top: 4px; }
+  .spark-labels span { color: #555d6e; font-size: 10px; }
+
+  .pool-bar-container { background: #0d0f14; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 6px; }
+  .pool-bar { background: linear-gradient(90deg, #00cc88, #00ff88); height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+
+  .empty-state { color: #555d6e; text-align: center; padding: 30px; font-style: italic; }
+
+  @media (max-width: 768px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    body { padding: 10px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="pulse" id="pulse"></div>
+    <div>
+      <h1>🧠 Brainrot Fleet Scanner</h1>
+      <div class="status-text" id="statusText">Connecting...</div>
+    </div>
+  </div>
+  <div class="status-text" id="lastUpdate"></div>
+</div>
+
+<!-- Stat Cards -->
+<div class="grid" id="statsGrid">
+  <div class="stat-card">
+    <div class="label">Total Finds</div>
+    <div class="value" id="totalFinds">—</div>
+    <div class="sub" id="findsSub"></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Tier 1 (Legendary)</div>
+    <div class="value" style="color:#ff4060" id="tier1Count">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Tier 2 (Rare)</div>
+    <div class="value" style="color:#ffcc44" id="tier2Count">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Tier 3 (Valuable)</div>
+    <div class="value" style="color:#00ff88" id="tier3Count">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Pool Size</div>
+    <div class="value" id="poolSize">—</div>
+    <div class="pool-bar-container"><div class="pool-bar" id="poolBar"></div></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Active Bots</div>
+    <div class="value" id="activeBots">—</div>
+    <div class="sub" id="botsSub"></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">In-Progress</div>
+    <div class="value" id="inProgress">—</div>
+    <div class="sub">assignments</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Joiner Served</div>
+    <div class="value" id="joinerServed">—</div>
+  </div>
+</div>
+
+<!-- Sparkline -->
+<div class="section">
+  <h2>Finds Per Minute (Last 10 Min)</h2>
+  <div class="sparkline-container">
+    <div class="sparkline" id="sparkline"></div>
+    <div class="spark-labels"><span>-10m</span><span>-5m</span><span>now</span></div>
+  </div>
+</div>
+
+<!-- Recent Finds -->
+<div class="section">
+  <h2>Recent Finds</h2>
+  <div style="overflow-x:auto;">
+    <table>
+      <thead>
+        <tr><th>Tier</th><th>Animal</th><th>Value</th><th>Players</th><th>Time</th><th>Server</th></tr>
+      </thead>
+      <tbody id="findsTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Bot Fleet -->
+<div class="section">
+  <h2>Bot Fleet Status</h2>
+  <div style="overflow-x:auto;">
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Bot ID</th><th>Last Seen</th><th>Scanning</th><th>Current Job</th></tr>
+      </thead>
+      <tbody id="botsTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(function() {
+  // Extract dashboard token from URL
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get('token') || '';
+
+  // Build the stats URL from current host
+  const baseUrl = window.location.origin;
+  const statsUrl = `${baseUrl}/internal/stats?token=${encodeURIComponent(token)}`;
+
+  function timeAgo(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm ago';
+  }
+
+  function copyToClipboard(text, btn) {
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    });
+  }
+
+  // Make copyToClipboard available globally for onclick handlers
+  window.copyToClipboard = copyToClipboard;
+
+  function renderSparkline(data) {
+    const container = document.getElementById('sparkline');
+    const max = Math.max(...data, 1);
+    container.innerHTML = data.map(v => {
+      const h = Math.max((v / max) * 100, 3);
+      return `<div class="spark-bar" style="height:${h}%" title="${v} finds"></div>`;
+    }).join('');
+  }
+
+  function renderFinds(reports) {
+    const tbody = document.getElementById('findsTable');
+    if (!reports || reports.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No finds yet — bots are scanning...</td></tr>';
+      return;
+    }
+    const now = Date.now();
+    tbody.innerHTML = reports.slice(0, 20).map(r => {
+      const tierClass = `tier-${Math.min(r.priority, 3)}`;
+      const tierLabel = r.priority === 1 ? 'P1' : r.priority === 2 ? 'P2' : 'P3';
+      const ago = timeAgo(now - r.receivedAt);
+      const shortId = (r.serverId || '').substring(0, 12);
+      return `<tr>
+        <td><span class="tier-badge ${tierClass}">${tierLabel}</span></td>
+        <td style="color:#fff;font-weight:600">${escapeHtml(r.brainrotName)}</td>
+        <td>${escapeHtml(r.value)}/s</td>
+        <td>${r.players}/8</td>
+        <td style="color:#8b92a0">${ago}</td>
+        <td>
+          <span style="color:#555d6e;font-family:monospace;font-size:11px">${shortId}…</span>
+          <button class="copy-btn" onclick="copyToClipboard('${r.serverId}', this)">Copy</button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderBots(bots) {
+    const tbody = document.getElementById('botsTable');
+    if (!bots || bots.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No bots registered yet</td></tr>';
+      return;
+    }
+    const now = Date.now();
+    // Sort: alive first, then by last seen
+    bots.sort((a, b) => {
+      if (a.alive !== b.alive) return a.alive ? -1 : 1;
+      return (b.agoMs || 0) - (a.agoMs || 0);
+    });
+    tbody.innerHTML = bots.map(b => {
+      const statusClass = b.alive ? 'alive' : 'dead';
+      const statusIcon = b.alive ? '🟢' : '🔴';
+      const ago = timeAgo(b.agoMs || 0);
+      const jobShort = b.jobId ? b.jobId.substring(0, 10) + '…' : '—';
+      return `<tr>
+        <td class="${statusClass}">${statusIcon} ${b.alive ? 'Alive' : 'Dead'}</td>
+        <td style="font-family:monospace;font-size:12px">${escapeHtml(b.botId)}</td>
+        <td style="color:#8b92a0">${ago}</td>
+        <td>${b.scanning ? '🔍 Yes' : '—'}</td>
+        <td style="color:#555d6e;font-family:monospace;font-size:11px">${jobShort}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch(statsUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      const n = data.notifier || {};
+      const s = data.scanner || {};
+
+      // Update status
+      document.getElementById('statusText').textContent = 'Live — refreshing every 5s';
+      document.getElementById('pulse').style.background = '#00ff88';
+      document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+      // Stat cards
+      document.getElementById('totalFinds').textContent = n.totalReports || 0;
+      document.getElementById('tier1Count').textContent = n.reportsByTier?.[1] || 0;
+      document.getElementById('tier2Count').textContent = n.reportsByTier?.[2] || 0;
+      document.getElementById('tier3Count').textContent = n.reportsByTier?.[3] || 0;
+      document.getElementById('joinerServed').textContent = n.totalServed || 0;
+
+      if (s) {
+        const poolSize = s.pool?.size || 0;
+        const poolMax = s.pool?.maxSize || 500;
+        document.getElementById('poolSize').textContent = poolSize;
+        document.getElementById('poolBar').style.width = Math.min((poolSize / poolMax) * 100, 100) + '%';
+        document.getElementById('activeBots').textContent = s.fleet?.activeInLast60s || 0;
+        document.getElementById('botsSub').textContent = `of ${s.fleet?.totalRegistered || 0} registered`;
+        document.getElementById('inProgress').textContent = s.assignments?.inProgress || 0;
+        renderBots(s.fleet?.bots || []);
+      } else {
+        document.getElementById('poolSize').textContent = '?';
+        document.getElementById('activeBots').textContent = '?';
+        document.getElementById('botsSub').textContent = 'scanner offline';
+        document.getElementById('inProgress').textContent = '?';
+      }
+
+      // Sparkline
+      renderSparkline(n.findsPerMinute || new Array(10).fill(0));
+
+      // Finds table
+      renderFinds(n.reports || []);
+
+      // Uptime
+      if (n.uptimeMs) {
+        const um = n.uptimeMs;
+        const h = Math.floor(um / 3600000);
+        const m = Math.floor((um % 3600000) / 60000);
+        document.getElementById('findsSub').textContent = `Uptime: ${h}h ${m}m`;
+      }
+    } catch (err) {
+      document.getElementById('statusText').textContent = 'Connection error: ' + err.message;
+      document.getElementById('pulse').style.background = '#ff4060';
+    }
+  }
+
+  // Initial fetch + 5s auto-refresh
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>

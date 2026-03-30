@@ -1,0 +1,92 @@
+# ============================================================================
+# render.yaml — Render.com Blueprint for Brainrot Fleet Scanner Backend
+# ============================================================================
+# Deploy both services from a single GitHub repo.
+# Instructions:
+#   1. Push this repo to GitHub
+#   2. Go to https://dashboard.render.com/blueprints
+#   3. Click "New Blueprint Instance" and connect your repo
+#   4. Render will detect this file and create both services
+#   5. Fill in the environment variables in each service's dashboard
+# ============================================================================
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # SCANNER BACKEND — Distributes Job IDs to the bot fleet
+  # ──────────────────────────────────────────────────────────────────────────
+  - type: web
+    name: brainrot-scanner
+    runtime: node
+    region: ohio                    # Change to match your VPS locations
+    plan: free                      # Use "starter" ($7/mo) for always-on
+    rootDir: scanner
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # --- Required ---
+      - key: API_KEY
+        sync: false                 # Render prompts you to set this
+      - key: INTERNAL_API_KEY
+        sync: false
+      # --- Roblox Scraper ---
+      - key: PLACE_ID
+        value: "109983668079237"
+      - key: PROXY_LIST
+        sync: false                 # Comma-separated proxy URLs
+      - key: SCRAPER_PAGE_DELAY_MS
+        value: "600"
+      - key: SCRAPER_MAX_PAGES
+        value: "30"
+      - key: SCRAPE_INTERVAL_MS
+        value: "45000"
+      - key: POOL_LOW_THRESHOLD
+        value: "50"
+      - key: POOL_MAX_SIZE
+        value: "500"
+      - key: SCRAPER_MIN_PLAYERS
+        value: "1"
+      # --- Fleet ---
+      - key: BATCH_SIZE
+        value: "8"
+      - key: ASSIGNMENT_TIMEOUT_MS
+        value: "45000"
+      - key: BOT_DEAD_THRESHOLD_MS
+        value: "90000"
+      - key: HISTORY_COOLDOWN_MS
+        value: "300000"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # NOTIFIER BACKEND — Receives reports & serves joiners
+  # ──────────────────────────────────────────────────────────────────────────
+  - type: web
+    name: brainrot-notifier
+    runtime: node
+    region: ohio
+    plan: free
+    rootDir: notifier
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # --- Required ---
+      - key: API_KEY
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: DASHBOARD_TOKEN
+        sync: false
+      # --- Optional ---
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: SCANNER_BACKEND_URL
+        sync: false                 # e.g. https://brainrot-scanner.onrender.com
+      # --- Tuning ---
+      - key: MAX_REPORTS
+        value: "200"
+      - key: STALENESS_WINDOW_MS
+        value: "90000"
+      - key: PLAYER_ROOM_BUFFER
+        value: "1"
+      - key: JOINER_COOLDOWN_MS
+        value: "20000"
