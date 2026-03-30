@@ -34,16 +34,12 @@ services:
         value: "109983668079237"
       - key: PROXY_LIST
         sync: false                 # Comma-separated proxy URLs
-      - key: SCRAPER_PAGE_DELAY_MS
-        value: "600"
-      - key: SCRAPER_MAX_PAGES
-        value: "30"
-      - key: SCRAPE_INTERVAL_MS
-        value: "45000"
-      - key: POOL_LOW_THRESHOLD
-        value: "50"
-      - key: POOL_MAX_SIZE
-        value: "500"
+      - key: SCRAPER_CYCLE_DELAY_MS
+        value: "2000"              # Delay between full scrape cycles
+      - key: PER_PROXY_PAGE_DELAY_MS
+        value: "100"               # Delay between pages per proxy
+      - key: MAX_PAGES_PER_PROXY
+        value: "50"                # Max pages each proxy chases per cycle
       - key: SCRAPER_MIN_PLAYERS
         value: "1"
       # --- Fleet ---
@@ -55,6 +51,8 @@ services:
         value: "90000"
       - key: HISTORY_COOLDOWN_MS
         value: "300000"
+      - key: HISTORY_MAX_SIZE
+        value: "50000"
 
   # ──────────────────────────────────────────────────────────────────────────
   # NOTIFIER BACKEND — Receives reports & serves joiners
