@@ -1,15 +1,16 @@
 // ============================================================================
-// server.js — Scanner Backend (High-Throughput Edition)
+// server.js — Scanner Backend (High-Throughput Edition) + Bot Dedup v2
 // ============================================================================
 //
 // Distributes Job IDs to the bot fleet using an atomic queue that serves
 // hundreds of concurrent requests per second with zero contention.
-// No pool cap, no artificial limits. The scraper fills, bots drain.
 //
 // Routes:
 //   POST /api/v1/get-job-assignment — Assign batch of Job IDs to a bot
 //   POST /scan-complete             — Bot finished scanning a server
 //   POST /heartbeat                 — Bot keepalive ping
+//   POST /scanner-register          — Bot registers username for dedup
+//   GET  /scanner-list              — Get all registered bot usernames
 //   GET  /status                    — Fleet & pool status (internal auth)
 //   GET  /health                    — Render.com health check
 //
@@ -27,21 +28,13 @@ const PORT = parseInt(process.env.PORT || "4000", 10);
 const API_KEY = process.env.API_KEY || "";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 
-// Job IDs per batch assigned to each bot
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "8", 10);
-
-// If bot doesn't complete scan within this window (ms), assignment expires
 const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || "45000", 10);
-
-// Cleanup sweep interval (ms)
 const CLEANUP_INTERVAL_MS = parseInt(process.env.CLEANUP_INTERVAL_MS || "10000", 10);
-
-// Bot considered dead after no heartbeat for this long (ms)
 const BOT_DEAD_THRESHOLD_MS = parseInt(process.env.BOT_DEAD_THRESHOLD_MS || "90000", 10);
-
-// Per-bot rate limit
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "3000", 10);
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "15", 10);
+const BOT_DEDUP_TTL_MS = parseInt(process.env.BOT_DEDUP_TTL_MS || "120000", 10);
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -55,30 +48,17 @@ function log(tag, msg) {
 // In-Memory State
 // ---------------------------------------------------------------------------
 
-/**
- * Active assignments: Map<jobId, { botId, assignedAt }>
- * Tracks in-progress scans. Expired entries get requeued.
- */
 const assignments = new Map();
-
-/**
- * Bot registry: Map<botId, { lastSeen, jobId, scanning, uptime }>
- */
 const botRegistry = new Map();
-
-/**
- * Rate limits: Map<botId, { count, windowStart }>
- */
+const dedupRegistry = new Map();
 const rateLimits = new Map();
 
-/**
- * Session counters.
- */
 const session = {
   totalAssigned: 0,
   totalCompleted: 0,
   totalHeartbeats: 0,
   totalExpiredReclaimed: 0,
+  totalRegistrations: 0,
   startTime: Date.now(),
 };
 
@@ -90,13 +70,12 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "512kb" }));
 
-// Request logger (skip /health to reduce noise)
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   const start = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - start;
-    const bot = req.body?.bot_id || "-";
+    const bot = req.body?.bot_id || req.body?.username || "-";
     log("HTTP", `${req.method} ${req.path} ${res.statusCode} ${ms}ms [${bot}]`);
   });
   next();
@@ -108,9 +87,8 @@ app.use((req, res, next) => {
 
 function requireAuth(req, res, next) {
   if (!API_KEY) return next();
-  if (req.headers["x-api-key"] !== API_KEY) {
-    return res.status(401).json({ error: "Invalid API key" });
-  }
+  const key = req.headers["x-api-key"] || req.headers["x-api-secret"];
+  if (key !== API_KEY) return res.status(401).json({ error: "Invalid API key" });
   next();
 }
 
@@ -132,7 +110,6 @@ function checkRateLimit(botId) {
   return e.count > RATE_LIMIT_MAX;
 }
 
-// Clean stale rate limit entries
 setInterval(() => {
   const now = Date.now();
   for (const [id, e] of rateLimits) {
@@ -147,16 +124,13 @@ setInterval(() => {
 setInterval(() => {
   const now = Date.now();
   let expired = 0;
-
   for (const [jobId, a] of assignments) {
     if (now - a.assignedAt > ASSIGNMENT_TIMEOUT_MS) {
       assignments.delete(jobId);
-      // Return to back of queue so another bot can scan it
       scraper.requeue(jobId);
       expired++;
     }
   }
-
   if (expired > 0) {
     session.totalExpiredReclaimed += expired;
     log("CLEANUP", `Reclaimed ${expired} expired assignments (total: ${session.totalExpiredReclaimed})`);
@@ -164,10 +138,25 @@ setInterval(() => {
 }, CLEANUP_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
-// ROUTE: POST /api/v1/get-job-assignment
+// Dedup Registry Cleanup
 // ---------------------------------------------------------------------------
-// Non-blocking. dequeueBatch() is O(1) per item, synchronous, and atomic.
-// Even with hundreds of concurrent requests, no two bots get the same ID.
+
+setInterval(() => {
+  const now = Date.now();
+  let removed = 0;
+  for (const [username, info] of dedupRegistry) {
+    if (now - info.last_seen > BOT_DEDUP_TTL_MS) {
+      dedupRegistry.delete(username);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    log("DEDUP", `Cleaned ${removed} stale registrations (remaining: ${dedupRegistry.size})`);
+  }
+}, 30000);
+
+// ---------------------------------------------------------------------------
+// ROUTE: POST /api/v1/get-job-assignment
 // ---------------------------------------------------------------------------
 
 app.post("/api/v1/get-job-assignment", requireAuth, (req, res) => {
@@ -189,10 +178,8 @@ app.post("/api/v1/get-job-assignment", requireAuth, (req, res) => {
     });
   }
 
-  // Atomic dequeue — guaranteed unique across all concurrent requests
   const batch = scraper.dequeueBatch(Math.min(BATCH_SIZE, available));
 
-  // Record assignments for expiry tracking
   const now = Date.now();
   for (const jobId of batch) {
     assignments.set(jobId, { botId: bot_id, assignedAt: now });
@@ -230,7 +217,7 @@ app.post("/scan-complete", requireAuth, (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.post("/heartbeat", requireAuth, (req, res) => {
-  const { bot_id, job_id, scanning, uptime } = req.body;
+  const { bot_id, job_id, scanning, uptime, username } = req.body;
   if (!bot_id) return res.status(400).json({ error: "bot_id required" });
 
   botRegistry.set(bot_id, {
@@ -238,10 +225,79 @@ app.post("/heartbeat", requireAuth, (req, res) => {
     jobId: job_id || "",
     scanning: !!scanning,
     uptime: uptime || 0,
+    username: username || "",
   });
+
+  // Also refresh dedup registry if username provided
+  if (username) {
+    dedupRegistry.set(username, {
+      bot_id,
+      last_seen: Date.now(),
+      job_id: job_id || null,
+    });
+  }
 
   session.totalHeartbeats++;
   return res.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// ROUTE: POST /scanner-register — Bot registers username for dedup
+// ---------------------------------------------------------------------------
+
+app.post("/scanner-register", requireAuth, (req, res) => {
+  try {
+    const { username, bot_id } = req.body;
+    if (!username) return res.status(400).json({ error: "username required" });
+
+    dedupRegistry.set(username, {
+      bot_id: bot_id || username,
+      last_seen: Date.now(),
+      job_id: req.body.job_id || null,
+    });
+
+    session.totalRegistrations++;
+    log("DEDUP", `Bot registered: ${username} (${bot_id || "no-id"}) | Total: ${dedupRegistry.size}`);
+
+    res.json({
+      success: true,
+      registered: username,
+      total_bots: dedupRegistry.size,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ROUTE: GET /scanner-list — Returns all registered bot usernames
+// ---------------------------------------------------------------------------
+
+app.get("/scanner-list", requireAuth, (req, res) => {
+  try {
+    const usernames = [];
+    const details = [];
+
+    for (const [username, info] of dedupRegistry) {
+      if (Date.now() - info.last_seen <= BOT_DEDUP_TTL_MS) {
+        usernames.push(username);
+        details.push({
+          username,
+          bot_id: info.bot_id,
+          last_seen_ago: Math.floor((Date.now() - info.last_seen) / 1000) + "s",
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      usernames,
+      count: usernames.length,
+      details,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -256,11 +312,22 @@ app.get("/status", requireInternalAuth, (req, res) => {
     const agoMs = now - info.lastSeen;
     bots.push({
       botId,
+      username: info.username || "",
       lastSeen: new Date(info.lastSeen).toISOString(),
       agoMs,
       alive: agoMs < BOT_DEAD_THRESHOLD_MS,
       scanning: info.scanning,
       jobId: info.jobId,
+    });
+  }
+
+  const dedupBots = [];
+  for (const [username, info] of dedupRegistry) {
+    dedupBots.push({
+      username,
+      bot_id: info.bot_id,
+      last_seen: new Date(info.last_seen).toISOString(),
+      alive: (now - info.last_seen) < BOT_DEDUP_TTL_MS,
     });
   }
 
@@ -282,6 +349,11 @@ app.get("/status", requireInternalAuth, (req, res) => {
       activeInLast60s: bots.filter((b) => b.agoMs < 60000).length,
       bots,
     },
+    dedup: {
+      registeredUsernames: dedupRegistry.size,
+      bots: dedupBots,
+      totalRegistrations: session.totalRegistrations,
+    },
     session: {
       ...session,
       uptimeMs: now - session.startTime,
@@ -302,6 +374,7 @@ app.get("/health", (req, res) => {
     pool: scraper.availableCount(),
     assignments: assignments.size,
     discovered: scraper.getStats().poolTotalDiscovered,
+    dedupBots: dedupRegistry.size,
   });
 });
 
@@ -334,7 +407,7 @@ app.listen(PORT, () => {
   const cfg = scraper.config;
 
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  🧠 BRAINROT FLEET SCANNER — Scanner Backend (Turbo)");
+  console.log("  BRAINROT FLEET SCANNER — Scanner Backend (Turbo + Dedup)");
   console.log("═══════════════════════════════════════════════════════════");
   console.log(`  Port:              ${PORT}`);
   console.log(`  API Key:           ${maskSecret(API_KEY)}`);
@@ -342,19 +415,20 @@ app.listen(PORT, () => {
   console.log(`  Batch Size:        ${BATCH_SIZE}`);
   console.log(`  Assignment TTL:    ${ASSIGNMENT_TIMEOUT_MS / 1000}s`);
   console.log(`  Bot Dead After:    ${BOT_DEAD_THRESHOLD_MS / 1000}s`);
+  console.log(`  Dedup TTL:         ${BOT_DEDUP_TTL_MS / 1000}s`);
   console.log("  ─── Scraper ───");
   console.log(`  Place ID:          ${cfg.PLACE_ID}`);
-  console.log(`  Proxies:           ${cfg.proxyCount || "none (direct)"}`);
+  console.log(`  Proxy Mode:        ${cfg.proxyMode}`);
+  console.log(`  Proxies:           ${cfg.proxyCount}`);
+  console.log(`  Workers:           ${cfg.effectiveWorkers}`);
   console.log(`  Cycle Delay:       ${cfg.CYCLE_DELAY_MS}ms`);
-  console.log(`  Page Delay/Proxy:  ${cfg.PER_PROXY_PAGE_DELAY_MS}ms`);
-  console.log(`  Max Pages/Proxy:   ${cfg.MAX_PAGES_PER_PROXY}`);
+  console.log(`  Page Delay:        ${cfg.PAGE_DELAY_MS}ms`);
+  console.log(`  Max Pages/Worker:  ${cfg.MAX_PAGES_PER_WORKER}`);
   console.log(`  Pool Cap:          NONE (unlimited)`);
   console.log(`  History Cooldown:  ${cfg.HISTORY_COOLDOWN_MS / 1000}s`);
   console.log(`  History Max:       ${cfg.HISTORY_MAX_SIZE}`);
   console.log("═══════════════════════════════════════════════════════════\n");
 
-  // Start the continuous scraper loop
   scraper.startContinuousLoop();
-
-  log("BOOT", "Scanner backend is live (turbo mode)");
+  log("BOOT", "Scanner backend is live (turbo + dedup mode)");
 });
